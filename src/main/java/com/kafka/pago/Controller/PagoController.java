@@ -29,7 +29,7 @@ public class PagoController {
     private final PagosServices pagosServices;
     private final EstadoPagoClienteRepositorio estadoRepositorio;
 
-    @Value("${transbank.return-url:/callback}")
+    @Value("${transbank.return-url:https://pedidos360.cloud/callback}")
     private String defaultReturnUrl;
 
     @Value("${transbank.commerce-code:597055555532}")
@@ -129,16 +129,20 @@ public class PagoController {
         if (requestedReturnUrl != null && (requestedReturnUrl.startsWith("http://") || requestedReturnUrl.startsWith("https://"))) {
             return requestedReturnUrl;
         }
+        String origin = httpRequest != null ? httpRequest.getHeader("Origin") : null;
+        if (origin != null && (origin.startsWith("http://") || origin.startsWith("https://"))) {
+            return origin.replaceAll("/$", "") + "/callback";
+        }
         if (defaultReturnUrl != null && (defaultReturnUrl.startsWith("http://") || defaultReturnUrl.startsWith("https://"))) {
             return defaultReturnUrl;
         }
-        String origin = httpRequest != null ? httpRequest.getHeader("Origin") : null;
-        if (origin != null && !origin.isBlank()) {
-            return origin.replaceAll("/$", "") + "/callback";
-        }
-        String host = httpRequest != null ? httpRequest.getServerName() : "127.0.0.1";
-        String scheme = httpRequest != null ? httpRequest.getScheme() : "http";
-        return scheme + "://" + host + ":5173/callback";
+        String host = (httpRequest != null && httpRequest.getServerName() != null && !httpRequest.getServerName().isBlank())
+                ? httpRequest.getServerName()
+                : "pedidos360.cloud";
+        String scheme = (httpRequest != null && httpRequest.getScheme() != null && !httpRequest.getScheme().isBlank())
+                ? httpRequest.getScheme()
+                : "https";
+        return scheme + "://" + host + "/callback";
     }
 
     /**

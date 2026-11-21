@@ -10,15 +10,15 @@ Microservicio transaccional desarrollado en **Spring Boot 3.4 (Java 21)** para l
    - Inicia transacciones contra el entorno de integración oficial (`https://webpay3gint.transbank.cl`).
    - Código de comercio de integración: `597055555532`.
    - API Key oficial de 64 caracteres: `579B532A7440BB0C9079DED94D31EA1615BACEB56610332264630D42D0A36B1C`.
-   - Genera tokens de transacción criptográficos (`token_ws`) y procesa el commit en `/callback`.
-2. **Motor Antifraude de Velocidad (Regla Crítica EV3):**
-   - Evalúa ráfagas de transacciones por cliente: **más de 3 intentos en menos de 10 segundos**.
-   - Ante detección de ataque de fuerza bruta o velocidad sospechosa, responde inmediatamente con **HTTP 429 Too Many Requests** y activa un bloqueo temporal de 30 minutos.
-   - Publica alertas de fraude hacia Apache Kafka en el tópico `topic-alertas-fraude`.
+   - Genera tokens de transacción criptográficos (`token_ws`) y procesa el commit en `/callback` resolviendo `returnUrl` desde `TRANSBANK_RETURN_URL` o el origen remoto sin referencias a `localhost` ni `127.0.0.1`.
+2. **Motor Antifraude de Velocidad y Tópicos Kafka (Regla Crítica EV3):**
+   - Publica cada intento de pago en el tópico Kafka **`payment-attempts`** (`PagosServices.producirIntentoPago`), el cual es consumido por `ConsumidorComponent` (`groupId = "payment-velocity-group"`).
+   - Evalúa ráfagas de transacciones por cliente en ventana deslizante: **más de 3 intentos en 10 segundos o menos (`<= 10s`)**.
+   - Ante detección de velocidad sospechosa, responde inmediatamente con **HTTP 429 Too Many Requests**, persiste el bloqueo temporal de 30 minutos en MySQL y publica la alerta de seguridad hacia Apache Kafka en el tópico **`pedidos.alertas.fraude`**.
 3. **Persistencia Transaccional:**
-   - Registra cada transacción (`INICIADO`, `AUTHORIZED`, `REJECTED`, `FRAUDE_BLOQUEADO`) en la base de datos relacional MySQL 8.0 (`pagos_db`).
+   - Registra el estado y contador de intentos por cliente (`EstadoPagoCliente`) en MySQL 8.0 (`pagos_db`).
 4. **Despliegue 100% Remoto (Regla "CERO LOCALHOST"):**
-   - Configuración desacoplada en `application.yml` mediante variables de entorno: `SERVER_PORT`, `SPRING_DATASOURCE_URL`, `SPRING_KAFKA_BOOTSTRAP_SERVERS`, `TRANSBANK_RETURN_URL`.
+   - Configuración desacoplada en `application.yml` y `PagoController` mediante variables de entorno: `SERVER_PORT`, `SPRING_DATASOURCE_URL`, `SPRING_KAFKA_BOOTSTRAP_SERVERS`, `TRANSBANK_RETURN_URL`.
 
 ---
 
@@ -29,7 +29,7 @@ Microservicio transaccional desarrollado en **Spring Boot 3.4 (Java 21)** para l
 | `GET` | `/api/pagos/status` | Healthcheck y estado del microservicio | `200 OK` (JSON) |
 | `POST` | `/api/pagos/iniciar` | Inicia pago y evalúa regla antifraude | `200 OK` (`url` + `token`) o `429 Too Many Requests` |
 | `POST` | `/api/pagos/commit?token_ws={token}` | Confirma transacción con Transbank | `200 OK` (Voucher electrónico) o `400` / `500` |
-| `GET` | `/api/pagos/estado-cliente/{clientId}` | Consulta estado de bloqueo y contador de intentos | `200 OK` (`bloqueado: boolean`, `intentos: int`) |
+| `GET` | `/api/pagos/estado-cliente/{clientId}` | Consulta estado de bloqueo y contador de intentos | `200 OK` (`bloqueado: boolean`, `cantidadIntentos: int`) |
 
 ---
 
@@ -45,9 +45,6 @@ Microservicio transaccional desarrollado en **Spring Boot 3.4 (Java 21)** para l
 
 El servicio incluye un `Dockerfile` multi-stage:
 ```bash
-# Construir imagen
 docker build -t pedidos360-pago-api .
-
-# Ejecutar contenedor
 docker run -d --name pedidos360-pago-api -p 8085:8085 pedidos360-pago-api
 ```
