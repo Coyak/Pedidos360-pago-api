@@ -5,7 +5,7 @@ spring:
   application:
     name: pago-api
   datasource:
-    url: ${SPRING_DATASOURCE_URL:jdbc:mysql://localhost:3306/pagos_db?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true}
+    url: ${SPRING_DATASOURCE_URL:jdbc:mysql://${DB_HOST:mysql-db}:${DB_PORT:3306}/${DB_NAME:pagos_db}?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true}
     username: ${SPRING_DATASOURCE_USERNAME:root}
     password: ${SPRING_DATASOURCE_PASSWORD:123456}
     driver-class-name: com.mysql.cj.jdbc.Driver
@@ -21,7 +21,7 @@ spring:
         format_sql: true
         dialect: org.hibernate.dialect.MySQLDialect
   kafka:
-    bootstrap-servers: ${SPRING_KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    bootstrap-servers: ${SPRING_KAFKA_BOOTSTRAP_SERVERS:${KAFKA_HOST:kafka}:${KAFKA_PORT:29092}}
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
@@ -36,8 +36,8 @@ spring:
       missing-topics-fatal: false
       auto-startup: true
 
-# Configuración Transbank Webpay Plus (Guía docente oficial)
+# Configuración Transbank Webpay Plus (Guía docente oficial - SDK 6.x Integración)
 transbank:
   commerce-code: ${TRANSBANK_COMMERCE_CODE:597055555532}
-  api-key: ${TRANSBANK_API_KEY:579B532A7440BB06BE4A3A796987C214}
-  return-url: ${TRANSBANK_RETURN_URL:http://localhost:5173/callback}
+  api-key: ${TRANSBANK_API_KEY:579B532A7440BB0C9079DED94D31EA1615BACEB56610332264630D42D0A36B1C}
+  return-url: ${TRANSBANK_RETURN_URL:https://pedidos360.cloud/callback}

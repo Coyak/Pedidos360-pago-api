@@ -2,9 +2,10 @@ package com.kafka.pago.Component;
 
 import com.kafka.pago.Model.EstadoPagoCliente;
 import com.kafka.pago.Repository.EstadoPagoClienteRepositorio;
+import com.kafka.pago.Service.PagosServices;
 import com.kafka.pago.dto.IntentoPagoDTO;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
@@ -19,12 +20,13 @@ import java.time.LocalDateTime;
  */
 @Slf4j
 @Component
+@RequiredArgsConstructor
 public class ConsumidorComponent {
 
     private static final String TOPIC_NOMBRE = "payment-attempts";
 
-    @Autowired
-    private EstadoPagoClienteRepositorio estadoRepositorio;
+    private final EstadoPagoClienteRepositorio estadoRepositorio;
+    private final PagosServices pagosServices;
 
     @KafkaListener(topics = TOPIC_NOMBRE, groupId = "payment-velocity-group")
     @Transactional
@@ -58,20 +60,19 @@ public class ConsumidorComponent {
             }
         }
 
-        // 2. Evaluar ventana de 10 segundos
+        // 2. Evaluar ventana de 10 segundos (> 3 intentos en <= 10s)
         if (estado.getActualizadoEn() != null) {
             long segundosTranscurridos = Duration.between(estado.getActualizadoEn(), ahora).toSeconds();
             if (segundosTranscurridos <= 10) {
                 estado.setCantidadIntentos(estado.getCantidadIntentos() + 1);
-                // Si alcanza 3 o más intentos en <= 10 segundos -> Bloqueo por 30 minutos
-                if (estado.getCantidadIntentos() >= 3) {
+                if (estado.getCantidadIntentos() > 3) {
                     estado.setBloqueado(true);
                     estado.setBloqueadoHasta(ahora.plusMinutes(30));
                     log.error("🚨 [ALERTA ANTIFRAUDE] Cliente {} BLOQUEADO POR 30 MINUTOS: {} intentos registrados en {} segundos.",
                             evento.getIdCliente(), estado.getCantidadIntentos(), segundosTranscurridos);
+                    pagosServices.publicarAlertaFraudeKafka(evento.getIdCliente(), estado.getCantidadIntentos());
                 }
             } else {
-                // Si pasaron más de 10 segundos, la ventana se reinicia a 1
                 estado.setCantidadIntentos(1);
             }
         } else {

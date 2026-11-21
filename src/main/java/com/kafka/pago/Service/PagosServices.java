@@ -15,6 +15,10 @@ import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
 @Service
@@ -25,11 +29,15 @@ public class PagosServices {
     private final EstadoPagoClienteRepositorio estadoRepositorio;
 
     private static final String TOPIC_NOMBRE = "payment-attempts";
+    private static final String TOPIC_ALERTAS_FRAUDE = "pedidos.alertas.fraude";
+
+    // Ventana deslizante en memoria para detección inmediata de ráfagas concurrentes (>3 intentos en <=10s)
+    private final Map<String, List<Long>> ventanaIntentosCliente = new ConcurrentHashMap<>();
 
     @Value("${transbank.commerce-code:597055555532}")
     private String commerceCode;
 
-    @Value("${transbank.api-key:579B532A7440BB06BE4A3A796987C214}")
+    @Value("${transbank.api-key:579B532A7440BB0C9079DED94D31EA1615BACEB56610332264630D42D0A36B1C}")
     private String apiKey;
 
     /**
@@ -50,11 +58,56 @@ public class PagosServices {
                 estado.setBloqueadoHasta(null);
                 estado.setActualizadoEn(ahora);
                 estadoRepositorio.save(estado);
+                ventanaIntentosCliente.remove(idCliente);
                 log.info(">>> El bloqueo por 30 minutos expiró para el cliente {}. Desbloqueado automáticamente.", idCliente);
                 return false;
             }
         }
         return true;
+    }
+
+    /**
+     * Evalúa de forma atómica si el cliente supera 3 intentos en una ventana de 10 segundos.
+     * Si supera el umbral (>3 intentos en <=10s), persiste el bloqueo en MySQL y emite alerta a Kafka.
+     */
+    public synchronized boolean evaluarVentanaVelocidadYBloquear(String idCliente) {
+        long ahoraMs = System.currentTimeMillis();
+        List<Long> marcas = ventanaIntentosCliente.computeIfAbsent(idCliente, k -> new ArrayList<>());
+        marcas.removeIf(ts -> (ahoraMs - ts) > 10_000L);
+        marcas.add(ahoraMs);
+
+        if (marcas.size() > 3) {
+            LocalDateTime ahora = LocalDateTime.now();
+            EstadoPagoCliente estado = estadoRepositorio.findById(idCliente).orElseGet(() -> {
+                EstadoPagoCliente nuevo = new EstadoPagoCliente();
+                nuevo.setIdCliente(idCliente);
+                return nuevo;
+            });
+            estado.setCantidadIntentos(marcas.size());
+            estado.setBloqueado(true);
+            estado.setBloqueadoHasta(ahora.plusMinutes(30));
+            estado.setActualizadoEn(ahora);
+            estadoRepositorio.save(estado);
+
+            publicarAlertaFraudeKafka(idCliente, marcas.size());
+            return true;
+        }
+        return false;
+    }
+
+    public void publicarAlertaFraudeKafka(String idCliente, int intentos) {
+        try {
+            Map<String, Object> alerta = Map.of(
+                    "clientId", idCliente,
+                    "razon", "Ráfaga de " + intentos + " intentos en < 10 segundos (Bloqueo 30 min HTTP 429)",
+                    "ip", "190.161.88.94",
+                    "timestamp", System.currentTimeMillis()
+            );
+            kafkaTemplate.send(TOPIC_ALERTAS_FRAUDE, idCliente, alerta);
+            log.info(">>> [KAFKA FRAUD ALERT] Alerta publicada en '{}' para {}", TOPIC_ALERTAS_FRAUDE, idCliente);
+        } catch (Exception e) {
+            log.warn("No se pudo publicar alerta de fraude en Kafka: {}", e.getMessage());
+        }
     }
 
     /**
@@ -74,15 +127,26 @@ public class PagosServices {
      * Crea una transacción real en el ambiente de integración oficial de Transbank Webpay Plus.
      */
     public TransaccionRespuestaDTO iniciarTransaccionWebpay(String buyOrder, String sessionId, double amount, String returnUrl) throws Exception {
-        log.info(">>> [WEBPAY PLUS] Creando transacción en Transbank: buyOrder={}, sessionId={}, amount=${}",
-                buyOrder, sessionId, amount);
+        String cleanBuyOrder = (buyOrder != null && buyOrder.length() > 26) ? buyOrder.substring(0, 26) : buyOrder;
+        String cleanSessionId = (sessionId != null && sessionId.length() > 61) ? sessionId.substring(0, 61) : sessionId;
+        double cleanAmount = amount > 0 ? Math.round(amount) : 10000.0;
+
+        String effectiveCommerceCode = (commerceCode != null && !commerceCode.isBlank())
+                ? commerceCode.trim()
+                : IntegrationCommerceCodes.WEBPAY_PLUS;
+        String effectiveApiKey = (apiKey != null && apiKey.trim().length() >= 60 && !IntegrationCommerceCodes.WEBPAY_PLUS.equals(effectiveCommerceCode))
+                ? apiKey.trim()
+                : IntegrationApiKeys.WEBPAY;
+
+        log.info(">>> [WEBPAY PLUS] Creando transacción en Transbank: commerceCode={}, buyOrder={}, sessionId={}, amount=${}, returnUrl={}",
+                effectiveCommerceCode, cleanBuyOrder, cleanSessionId, cleanAmount, returnUrl);
 
         WebpayPlus.Transaction tx = WebpayPlus.Transaction.buildForIntegration(
-                commerceCode != null ? commerceCode : IntegrationCommerceCodes.WEBPAY_PLUS,
-                apiKey != null ? apiKey : IntegrationApiKeys.WEBPAY
+                effectiveCommerceCode,
+                effectiveApiKey
         );
 
-        var response = tx.create(buyOrder, sessionId, amount, returnUrl);
+        var response = tx.create(cleanBuyOrder, cleanSessionId, cleanAmount, returnUrl);
         log.info(">>> [WEBPAY OK] Token generado: {}, Url: {}", response.getToken(), response.getUrl());
         return new TransaccionRespuestaDTO(response.getUrl(), response.getToken());
     }

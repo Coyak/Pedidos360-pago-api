@@ -8,6 +8,7 @@ import com.kafka.pago.Repository.EstadoPagoClienteRepositorio;
 import com.kafka.pago.Service.PagosServices;
 import com.kafka.pago.dto.PeticionPagoDTO;
 import com.kafka.pago.dto.TransaccionRespuestaDTO;
+import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -28,13 +29,13 @@ public class PagoController {
     private final PagosServices pagosServices;
     private final EstadoPagoClienteRepositorio estadoRepositorio;
 
-    @Value("${transbank.return-url:http://localhost:5173/callback}")
+    @Value("${transbank.return-url:/callback}")
     private String defaultReturnUrl;
 
     @Value("${transbank.commerce-code:597055555532}")
     private String commerceCode;
 
-    @Value("${transbank.api-key:579B532A7440BB06BE4A3A796987C214}")
+    @Value("${transbank.api-key:579B532A7440BB0C9079DED94D31EA1615BACEB56610332264630D42D0A36B1C}")
     private String apiKey;
 
     /**
@@ -69,10 +70,10 @@ public class PagoController {
 
     /**
      * 1. Solicitud de Pago y Validación de Bloqueo Antifraude (/api/pagos/iniciar)
-     * Requisito y Pauta de Clase exacta
+     * Requisito y Pauta de Clase exacta: >3 intentos en <10 segundos -> HTTP 429 Too Many Requests
      */
     @PostMapping("/iniciar")
-    public ResponseEntity<?> iniciarPago(@RequestBody PeticionPagoDTO peticion) {
+    public ResponseEntity<?> iniciarPago(@RequestBody PeticionPagoDTO peticion, HttpServletRequest httpRequest) {
         log.info(">>> [POST /api/pagos/iniciar] Petición recibida para cliente: {}, monto: ${}",
                 peticion.getClientId(), peticion.getAmount());
 
@@ -84,25 +85,24 @@ public class PagoController {
             peticion.setTransactionId("TX-" + System.currentTimeMillis() + "-" + UUID.randomUUID().toString().substring(0, 4));
         }
 
-        // 1.1 Validación síncrona de bloqueo por fraude
-        if (pagosServices.verificarSiUsuarioEstaBloqueado(peticion.getClientId())) {
+        // 1.1 Publicar intento de pago hacia Kafka (Velocity Check Topic)
+        pagosServices.producirIntentoPago(peticion.getClientId(), peticion.getAmount(), peticion.getTransactionId());
+
+        // 1.2 Validación síncrona + ventana deslizante (>3 intentos en <=10s)
+        if (pagosServices.verificarSiUsuarioEstaBloqueado(peticion.getClientId())
+                || pagosServices.evaluarVentanaVelocidadYBloquear(peticion.getClientId())) {
             log.warn(">>> [BLOQUEO 429] Intento de pago rechazado para cliente penalizado: {}", peticion.getClientId());
             return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(Map.of(
                     "status", "BLOQUEADO_POR_FRAUDE",
-                    "mensaje", "Usuario bloqueado preventivamente por sospecha de fraude (múltiples intentos en menos de 10 segundos). Por favor intente nuevamente en 30 minutos.",
+                    "mensaje", "Usuario bloqueado preventivamente por sospecha de fraude (más de 3 intentos en menos de 10 segundos). Por favor intente nuevamente en 30 minutos.",
                     "bloqueado", true,
                     "tiempoCastigoMinutos", 30
             ));
         }
 
-        // 1.2 Auditoría asíncrona hacia Kafka (Velocity Check)
-        pagosServices.producirIntentoPago(peticion.getClientId(), peticion.getAmount(), peticion.getTransactionId());
-
         // 1.3 Integración con Webpay Plus REST
         try {
-            String returnUrl = peticion.getReturnUrl() != null && !peticion.getReturnUrl().isEmpty()
-                    ? peticion.getReturnUrl()
-                    : defaultReturnUrl;
+            String returnUrl = resolverReturnUrl(peticion.getReturnUrl(), httpRequest);
 
             TransaccionRespuestaDTO transaccionWebpay = pagosServices.iniciarTransaccionWebpay(
                     peticion.getTransactionId(),
@@ -123,6 +123,22 @@ public class PagoController {
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                     .body(Map.of("error", "Error al conectar con la pasarela de pagos Webpay: " + e.getMessage()));
         }
+    }
+
+    private String resolverReturnUrl(String requestedReturnUrl, HttpServletRequest httpRequest) {
+        if (requestedReturnUrl != null && (requestedReturnUrl.startsWith("http://") || requestedReturnUrl.startsWith("https://"))) {
+            return requestedReturnUrl;
+        }
+        if (defaultReturnUrl != null && (defaultReturnUrl.startsWith("http://") || defaultReturnUrl.startsWith("https://"))) {
+            return defaultReturnUrl;
+        }
+        String origin = httpRequest != null ? httpRequest.getHeader("Origin") : null;
+        if (origin != null && !origin.isBlank()) {
+            return origin.replaceAll("/$", "") + "/callback";
+        }
+        String host = httpRequest != null ? httpRequest.getServerName() : "127.0.0.1";
+        String scheme = httpRequest != null ? httpRequest.getScheme() : "http";
+        return scheme + "://" + host + ":5173/callback";
     }
 
     /**
@@ -147,9 +163,16 @@ public class PagoController {
         }
 
         try {
+            String effectiveCommerceCode = (commerceCode != null && !commerceCode.isBlank())
+                    ? commerceCode.trim()
+                    : IntegrationCommerceCodes.WEBPAY_PLUS;
+            String effectiveApiKey = (apiKey != null && apiKey.trim().length() >= 60 && !IntegrationCommerceCodes.WEBPAY_PLUS.equals(effectiveCommerceCode))
+                    ? apiKey.trim()
+                    : IntegrationApiKeys.WEBPAY;
+
             WebpayPlus.Transaction tx = WebpayPlus.Transaction.buildForIntegration(
-                    commerceCode != null ? commerceCode : IntegrationCommerceCodes.WEBPAY_PLUS,
-                    apiKey != null ? apiKey : IntegrationApiKeys.WEBPAY
+                    effectiveCommerceCode,
+                    effectiveApiKey
             );
 
             var response = tx.commit(tokenWs);
