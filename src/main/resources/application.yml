@@ -35,6 +35,19 @@ spring:
     listener:
       missing-topics-fatal: false
       auto-startup: true
+  rabbitmq:
+    host: ${RABBITMQ_HOST:rabbitmq1}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USERNAME:pedidos360_user}
+    password: ${RABBITMQ_PASSWORD:pedidos360_pass}
+
+# Topología RabbitMQ para notificar compras confirmadas a Auditoría y Notificaciones
+pedidos360:
+  rabbitmq:
+    exchange:
+      pedidos: ${RABBITMQ_EXCHANGE_PEDIDOS:pedidos.exchange}
+    routing-key:
+      creado: ${RABBITMQ_ROUTING_KEY_CREADO:pedidos.pedido.creado}
 
 # Configuración Transbank Webpay Plus (Guía docente oficial - SDK 6.x Integración)
 transbank:

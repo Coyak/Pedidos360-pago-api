@@ -9,6 +9,7 @@ import com.kafka.pago.dto.IntentoPagoDTO;
 import com.kafka.pago.dto.TransaccionRespuestaDTO;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
@@ -27,6 +28,7 @@ public class PagosServices {
 
     private final KafkaTemplate<String, Object> kafkaTemplate;
     private final EstadoPagoClienteRepositorio estadoRepositorio;
+    private final RabbitTemplate rabbitTemplate;
 
     private static final String TOPIC_NOMBRE = "payment-attempts";
     private static final String TOPIC_ALERTAS_FRAUDE = "pedidos.alertas.fraude";
@@ -39,6 +41,12 @@ public class PagosServices {
 
     @Value("${transbank.api-key:579B532A7440BB0C9079DED94D31EA1615BACEB56610332264630D42D0A36B1C}")
     private String apiKey;
+
+    @Value("${pedidos360.rabbitmq.exchange.pedidos:pedidos.exchange}")
+    private String rabbitExchange;
+
+    @Value("${pedidos360.rabbitmq.routing-key.creado:pedidos.pedido.creado}")
+    private String rabbitRoutingKey;
 
     /**
      * Verifica de forma síncrona en base de datos si el cliente está penalizado por la regla antifraude.
@@ -152,9 +160,55 @@ public class PagosServices {
     }
 
     /**
-     * Callback de confirmación tras el retorno de Webpay.
+     * Callback de confirmación tras el retorno de Webpay y publicación en RabbitMQ.
      */
     public void gestionarResultadoCallbackPago(String idCliente, boolean aprobado) {
-        log.info(">>> [CALLBACK PAGO] Resultado para cliente {}: aprobado={}", idCliente, aprobado);
+        gestionarResultadoCallbackPago(idCliente, "PED-" + System.currentTimeMillis(), 10000.0, aprobado);
+    }
+
+    public void gestionarResultadoCallbackPago(String idCliente, String buyOrder, double amount, boolean aprobado) {
+        log.info(">>> [CALLBACK PAGO] Resultado para cliente {}: orden={}, monto=${}, aprobado={}",
+                idCliente, buyOrder, amount, aprobado);
+
+        if (!aprobado) {
+            return;
+        }
+
+        try {
+            String emailDestino = (idCliente != null && idCliente.contains("@"))
+                    ? idCliente
+                    : "cliente@pedidos360.com";
+
+            String pedidoId = (buyOrder != null && !buyOrder.isBlank())
+                    ? buyOrder
+                    : "PED-" + System.currentTimeMillis();
+
+            Map<String, Object> item = Map.of(
+                    "productoId", "WEBPAY-TX",
+                    "nombreProducto", "Orden Confirmada Webpay Plus (" + pedidoId + ")",
+                    "cantidad", 1,
+                    "precioUnitario", amount
+            );
+
+            Map<String, Object> eventoPedido = Map.of(
+                    "pedidoId", pedidoId,
+                    "status", "PAGADO_WEBPAY",
+                    "clienteEmail", emailDestino,
+                    "direccionEnvio", "Despacho Confirmado vía Transbank Webpay Plus",
+                    "totalPagar", amount,
+                    "fechaCreacion", LocalDateTime.now().toString(),
+                    "items", List.of(item)
+            );
+
+            rabbitTemplate.convertAndSend(rabbitExchange, rabbitRoutingKey, eventoPedido, message -> {
+                message.getMessageProperties().getHeaders().remove("__TypeId__");
+                return message;
+            });
+
+            log.info(">>> [RABBITMQ PUBLISHED] Evento enviado a exchange='{}', routingKey='{}' para pedidoId={}",
+                    rabbitExchange, rabbitRoutingKey, pedidoId);
+        } catch (Exception e) {
+            log.error(">>> [RABBITMQ ERROR] No se pudo publicar el pago aprobado en RabbitMQ: {}", e.getMessage(), e);
+        }
     }
 }

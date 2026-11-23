@@ -184,7 +184,12 @@ public class PagoController {
                     response.getStatus(), response.getBuyOrder(), response.getAmount());
 
             boolean autorizado = "AUTHORIZED".equals(response.getStatus());
-            pagosServices.gestionarResultadoCallbackPago(response.getSessionId(), autorizado);
+            pagosServices.gestionarResultadoCallbackPago(
+                    response.getSessionId(),
+                    response.getBuyOrder(),
+                    response.getAmount(),
+                    autorizado
+            );
 
             if (autorizado) {
                 return ResponseEntity.ok(Map.of(
