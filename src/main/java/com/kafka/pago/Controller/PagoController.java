@@ -85,16 +85,19 @@ public class PagoController {
             peticion.setTransactionId("TX-" + System.currentTimeMillis() + "-" + UUID.randomUUID().toString().substring(0, 4));
         }
 
-        // 1.1 Publicar intento de pago hacia Kafka (Velocity Check Topic)
+        // 1.1 Validación síncrona en BD (estado_pago_cliente) + ventana deslizante (>3 intentos en <=10s) ANTES de ir a Transbank
+        EstadoPagoCliente estadoActual = estadoRepositorio.findById(peticion.getClientId()).orElse(null);
+        boolean bloqueadoEnBd = (estadoActual != null && estadoActual.isBloqueado())
+                && pagosServices.verificarSiUsuarioEstaBloqueado(peticion.getClientId());
+
+        // Publicar intento de pago hacia Kafka (Velocity Check Topic)
         pagosServices.producirIntentoPago(peticion.getClientId(), peticion.getAmount(), peticion.getTransactionId());
 
-        // 1.2 Validación síncrona + ventana deslizante (>3 intentos en <=10s)
-        if (pagosServices.verificarSiUsuarioEstaBloqueado(peticion.getClientId())
-                || pagosServices.evaluarVentanaVelocidadYBloquear(peticion.getClientId())) {
-            log.warn(">>> [BLOQUEO 429] Intento de pago rechazado para cliente penalizado: {}", peticion.getClientId());
+        if (bloqueadoEnBd || pagosServices.evaluarVentanaVelocidadYBloquear(peticion.getClientId())) {
+            log.warn(">>> [BLOQUEO 429] Intento de pago rechazado para cliente penalizado en estado_pago_cliente: {}", peticion.getClientId());
             return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(Map.of(
                     "status", "BLOQUEADO_POR_FRAUDE",
-                    "mensaje", "Usuario bloqueado preventivamente por sospecha de fraude (más de 3 intentos en menos de 10 segundos). Por favor intente nuevamente en 30 minutos.",
+                    "mensaje", "Tu cuenta está bloqueada temporalmente por intentos inusuales (más de 3 intentos en menos de 10 segundos). Intenta nuevamente en 30 minutos.",
                     "bloqueado", true,
                     "tiempoCastigoMinutos", 30
             ));
@@ -118,6 +121,14 @@ public class PagoController {
                     "transactionId", peticion.getTransactionId()
             ));
 
+        } catch (IllegalStateException fraudEx) {
+            log.warn(">>> [BLOQUEO PREVENTIVO BD] {}", fraudEx.getMessage());
+            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(Map.of(
+                    "status", "BLOQUEADO_POR_FRAUDE",
+                    "mensaje", "Tu cuenta está bloqueada temporalmente por intentos inusuales.",
+                    "bloqueado", true,
+                    "tiempoCastigoMinutos", 30
+            ));
         } catch (Exception e) {
             log.error(">>> [ERROR WEBPAY] No se pudo crear transacción en Transbank: {}", e.getMessage(), e);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)

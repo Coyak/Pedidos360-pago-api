@@ -47,17 +47,19 @@ public class ConsumidorComponent {
                     return nuevo;
                 });
 
-        // 1. Si está bloqueado, revisar si los 30 minutos ya pasaron
-        if (estado.isBloqueado() && estado.getBloqueadoHasta() != null) {
-            if (ahora.isBefore(estado.getBloqueadoHasta())) {
-                log.warn(">>> [ANTIFRAUDE] El cliente {} sigue bloqueado hasta {}", evento.getIdCliente(), estado.getBloqueadoHasta());
-                return;
-            } else {
+        // 1. Si ya está bloqueado en BD por PagosServices, respetar el bloqueo hasta que expiren los 30 minutos
+        if (estado.isBloqueado()) {
+            if (estado.getBloqueadoHasta() != null && ahora.isAfter(estado.getBloqueadoHasta())) {
                 estado.setBloqueado(false);
                 estado.setCantidadIntentos(0);
                 estado.setBloqueadoHasta(null);
+                estado.setActualizadoEn(ahora);
+                estadoRepositorio.save(estado);
                 log.info(">>> [ANTIFRAUDE] Castigo de 30 min expiró para {}. Desbloqueado.", evento.getIdCliente());
+            } else {
+                log.warn(">>> [ANTIFRAUDE] El cliente {} permanece bloqueado en BD hasta {}", evento.getIdCliente(), estado.getBloqueadoHasta());
             }
+            return;
         }
 
         // 2. Evaluar ventana de 10 segundos (> 3 intentos en <= 10s)

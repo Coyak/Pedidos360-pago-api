@@ -32,6 +32,7 @@ public class PagosServices {
 
     private static final String TOPIC_NOMBRE = "payment-attempts";
     private static final String TOPIC_ALERTAS_FRAUDE = "pedidos.alertas.fraude";
+    private static final String TOPIC_AUDITORIA = "pedidos-auditoria-topic";
 
     // Ventana deslizante en memoria para detección inmediata de ráfagas concurrentes (>3 intentos en <=10s)
     private final Map<String, List<Long>> ventanaIntentosCliente = new ConcurrentHashMap<>();
@@ -133,8 +134,16 @@ public class PagosServices {
 
     /**
      * Crea una transacción real en el ambiente de integración oficial de Transbank Webpay Plus.
+     * Valida previamente en base de datos (estado_pago_cliente) que el cliente no tenga bloqueado == true.
      */
     public TransaccionRespuestaDTO iniciarTransaccionWebpay(String buyOrder, String sessionId, double amount, String returnUrl) throws Exception {
+        // Validación estricta en BD (estado_pago_cliente) ANTES de conectar con Transbank
+        EstadoPagoCliente estadoDb = estadoRepositorio.findById(sessionId).orElse(null);
+        if ((estadoDb != null && estadoDb.isBloqueado()) || verificarSiUsuarioEstaBloqueado(sessionId)) {
+            log.warn(">>> [BLOQUEO ANTIFRAUDE BD] Rechazando inicio de Webpay: cliente {} tiene bloqueado=true en estado_pago_cliente", sessionId);
+            throw new IllegalStateException("BLOQUEADO_POR_FRAUDE: Tu cuenta está bloqueada temporalmente por intentos inusuales.");
+        }
+
         String cleanBuyOrder = (buyOrder != null && buyOrder.length() > 26) ? buyOrder.substring(0, 26) : buyOrder;
         String cleanSessionId = (sessionId != null && sessionId.length() > 61) ? sessionId.substring(0, 61) : sessionId;
         double cleanAmount = amount > 0 ? Math.round(amount) : 10000.0;
@@ -200,15 +209,29 @@ public class PagosServices {
                     "items", List.of(item)
             );
 
-            rabbitTemplate.convertAndSend(rabbitExchange, rabbitRoutingKey, eventoPedido, message -> {
-                message.getMessageProperties().getHeaders().remove("__TypeId__");
-                return message;
-            });
+            // 1. Publicar en RabbitMQ para Notificaciones por correo (notificaciones-api)
+            try {
+                rabbitTemplate.convertAndSend(rabbitExchange, rabbitRoutingKey, eventoPedido, message -> {
+                    message.getMessageProperties().getHeaders().remove("__TypeId__");
+                    return message;
+                });
+                log.info(">>> [RABBITMQ PUBLISHED] Evento de notificación enviado a exchange='{}', routingKey='{}' para pedidoId={}",
+                        rabbitExchange, rabbitRoutingKey, pedidoId);
+            } catch (Exception rabbitEx) {
+                log.error(">>> [RABBITMQ ERROR] No se pudo publicar notificación en RabbitMQ: {}", rabbitEx.getMessage());
+            }
 
-            log.info(">>> [RABBITMQ PUBLISHED] Evento enviado a exchange='{}', routingKey='{}' para pedidoId={}",
-                    rabbitExchange, rabbitRoutingKey, pedidoId);
+            // 2. Publicar en Apache Kafka para Auditoría Transaccional (auditoria-api -> pedidos-auditoria-topic)
+            try {
+                kafkaTemplate.send(TOPIC_AUDITORIA, pedidoId, eventoPedido);
+                log.info(">>> [KAFKA AUDITORÍA PUBLISHED] Evento enviado a tópico '{}' para pedidoId={}",
+                        TOPIC_AUDITORIA, pedidoId);
+            } catch (Exception kafkaEx) {
+                log.error(">>> [KAFKA AUDITORÍA ERROR] No se pudo publicar evento en tópico '{}': {}",
+                        TOPIC_AUDITORIA, kafkaEx.getMessage());
+            }
         } catch (Exception e) {
-            log.error(">>> [RABBITMQ ERROR] No se pudo publicar el pago aprobado en RabbitMQ: {}", e.getMessage(), e);
+            log.error(">>> [CALLBACK ERROR] Error al construir eventos post-pago: {}", e.getMessage(), e);
         }
     }
 }
